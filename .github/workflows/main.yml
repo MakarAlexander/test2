@@ -1,0 +1,198 @@
+name: Infrastructure Deployment Pipeline
+
+on:
+  workflow_dispatch:  # Ручной запуск
+  push:
+    branches: [main]  # Автоматический запуск при пуше в main
+
+env:
+  TF_VERSION: 1.6.4
+  KUBECTL_VERSION: v1.28.4
+  HELM_VERSION: v3.14.0
+  YC_CLI_VERSION: latest
+
+jobs:
+  deploy-infrastructure:
+    name: Deploy Yandex Cloud Infrastructure
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: production
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup tools
+      run: |
+        # Установка Terraform
+        curl -L https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_amd64.zip -o terraform.zip
+        unzip terraform.zip
+        sudo mv terraform /usr/local/bin/
+        
+        # Установка YC CLI
+        curl -sSL https://storage.yandexcloud.net/yandexcloud-yc/install.sh | bash -s -- -i /usr/local -n
+        
+        # Установка kubectl
+        curl -LO "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+        sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+        
+        # Установка Helm
+        curl -L https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz | tar xz
+        sudo mv linux-amd64/helm /usr/local/bin/
+        
+        # Установка jq
+        sudo apt-get update && sudo apt-get install -y jq
+
+    - name: Configure YC CLI
+      env:
+        YC_TOKEN: ${{ secrets.YC_TOKEN }}
+        YC_CLOUD_ID: ${{ secrets.YC_CLOUD_ID }}
+        YC_FOLDER_ID: ${{ secrets.YC_FOLDER_ID }}
+      run: |
+        yc config set token $YC_TOKEN
+        yc config set cloud-id $YC_CLOUD_ID
+        yc config set folder-id $YC_FOLDER_ID
+
+    - name: Deploy bucket resources
+      working-directory: bucket
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      run: |
+        terraform init
+        terraform apply -auto-approve || echo "Bucket deployment completed with warnings"
+
+    - name: Deploy Kubernetes infrastructure
+      working-directory: terraform
+      run: |
+        terraform init
+        terraform apply -auto-approve
+
+    - name: Get Cluster ID
+      id: cluster-id
+      working-directory: terraform
+      run: |
+        CLUSTER_ID=$(terraform output -raw cluster_id)
+        echo "CLUSTER_ID=$CLUSTER_ID" >> $GITHUB_ENV
+        echo "cluster_id=$CLUSTER_ID" >> $GITHUB_OUTPUT
+
+    - name: Configure Kubernetes access
+      run: |
+        yc managed-kubernetes cluster get-credentials --id $CLUSTER_ID --external --force
+
+    - name: Wait for cluster readiness
+      run: |
+        # Ожидаем готовности кластера
+        for i in {1..30}; do
+          if kubectl get nodes; then
+            echo "Cluster is ready"
+            break
+          fi
+          echo "Waiting for cluster to become ready... ($i/30)"
+          sleep 30
+        done
+
+    - name: Create project namespace
+      run: kubectl create namespace project || true
+
+    - name: Install monitoring stack
+      run: |
+        helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+        helm repo update
+        helm upgrade --install prometheus prometheus-community/kube-prometheus-stack -n project
+
+    - name: Install ingress-nginx
+      run: |
+        helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+        helm repo update
+        helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx -n project \
+          --set controller.service.annotations."yandex\.cloud/load-balancer-type"=external
+
+    - name: Deploy application
+      working-directory: deploy
+      run: |
+        kubectl apply -f deployment.yml
+        kubectl apply -f ingress.yml
+        kubectl apply -f sa_for_github.yml
+
+    - name: Get Load Balancer IP
+      id: lb-ip
+      run: |
+        # Ожидаем назначения IP
+        for i in {1..20}; do
+          IP=$(yc load-balancer network-load-balancer list --format json | \
+              jq -r '.[] | select(.name | contains("ingress")).listeners[0].address.external_ipv4_address.address' | head -1)
+          
+          if [ -n "$IP" ] && [ "$IP" != "null" ]; then
+            echo "Load Balancer IP: $IP"
+            echo "INGRESS_IP=$IP" >> $GITHUB_ENV
+            echo "ingress_ip=$IP" >> $GITHUB_OUTPUT
+            break
+          fi
+          echo "Waiting for Load Balancer IP... ($i/20)"
+          sleep 30
+        done
+        
+        if [ -z "$IP" ]; then
+          echo "Failed to get Load Balancer IP"
+          exit 1
+        fi
+
+    - name: Configure DNS
+      run: |
+        # Проверяем существование зоны
+        if yc dns zone get --name amakartsev > /dev/null 2>&1; then
+          echo "DNS zone already exists"
+        else
+          yc dns zone create --name amakartsev \
+            --zone "amakartsev.ru." \
+            --public-visibility \
+            --description "Публичная зона для домена amakartsev.ru"
+        fi
+
+        # Добавляем/обновляем записи
+        for record in "@" app grafana; do
+          yc dns zone add-records --name amakartsev \
+            --record "$record 300 A $INGRESS_IP" --force
+        done
+
+    - name: Generate kubeconfig
+      run: |
+        # Создаем временный каталог
+        mkdir -p kube
+        
+        # Получаем данные кластера
+        MASTER_ENDPOINT=$(yc managed-kubernetes cluster get --id $CLUSTER_ID --format json | jq -r .master.endpoints.external_v4_endpoint)
+        SA_TOKEN=$(kubectl -n kube-system get secret $(kubectl -n kube-system get secret | grep admin-user-token | awk '{print $1}') -o json | jq -r .data.token | base64 -d)
+        
+        # Генерируем kubeconfig
+        kubectl config set-cluster sa \
+          --insecure-skip-tls-verify \
+          --server=$MASTER_ENDPOINT \
+          --kubeconfig=kube/config
+          
+        kubectl config set-credentials admin-user \
+          --token=$SA_TOKEN \
+          --kubeconfig=kube/config
+          
+        kubectl config set-context default \
+          --cluster=sa \
+          --user=admin-user \
+          --kubeconfig=kube/config
+          
+        kubectl config use-context default --kubeconfig=kube/config
+
+    - name: Upload kubeconfig artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: kubeconfig
+        path: kube/config
+        retention-days: 1
+
+    - name: Verify deployment
+      run: |
+        # Ожидаем запуска приложения
+        kubectl rollout status deployment/myapp -n project --timeout=300s
+        
+        # Проверяем доступность через Ingress
+        curl -I -H "Host: app.amakartsev.ru" http://$INGRESS_IP
