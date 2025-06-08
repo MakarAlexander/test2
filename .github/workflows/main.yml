@@ -24,12 +24,15 @@ jobs:
 
     - name: Setup tools
       run: |
-        # Установка Terraform
+        # Установка Terraform через временную директорию
+        TEMP_DIR=$(mktemp -d)
+        pushd "$TEMP_DIR"
         curl -L "https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_amd64.zip" -o terraform.zip
-        sudo unzip -o terraform.zip
+        unzip terraform.zip
         sudo mv terraform /usr/local/bin/
-        rm terraform.zip
-        
+        popd
+        rm -rf "$TEMP_DIR"
+    
         # Установка YC CLI
         curl -sSL https://storage.yandexcloud.net/yandexcloud-yc/install.sh | bash -s -- -i /usr/local -n -f
         
@@ -38,14 +41,16 @@ jobs:
         sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
         rm kubectl
         
-        # Установка Helm
+        # Установка Helm через временную директорию
+        TEMP_DIR=$(mktemp -d)
+        pushd "$TEMP_DIR"
         curl -L "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" | tar xz
         sudo mv linux-amd64/helm /usr/local/bin/helm
-        rm -rf linux-amd64
+        popd
+        rm -rf "$TEMP_DIR"
         
         # Установка jq
         sudo apt-get update && sudo apt-get install -y jq
-      shell: bash
       env:
         TF_VERSION: 1.8.4
         KUBECTL_VERSION: v1.28.4
