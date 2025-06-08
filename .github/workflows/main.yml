@@ -183,11 +183,10 @@ jobs:
         kubectl config use-context default --kubeconfig=kube/config
 
     - name: Upload kubeconfig artifact
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: kubeconfig
         path: kube/config
-        retention-days: 1
 
     - name: Verify deployment
       run: |
